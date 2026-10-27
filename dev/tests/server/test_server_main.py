@@ -2,20 +2,181 @@ import io
 import math
 import signal
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dev.tests.server_fixtures import main_args, unprepared_hold
 from install import families
 from server import diagnostics
 from server import protocol as native_wire
 from server import server as api
 from server.origins import ANY_ORIGIN
 
+from dev.tests.server_fixtures import main_args, unprepared_hold
+
 
 class ServerMainTests(unittest.TestCase):
+    def test_lazy_main_listens_before_loading_tokenizer_or_native(self):
+        args = main_args(lazy_load=True)
+        runtime = mock.Mock()
+        runtime.readiness = native_wire.ReadyEvent(4, 131072, False)
+        server = mock.Mock(server_port=8000)
+        tokenizer = object()
+
+        def serve():
+            tokenizer_type.assert_not_called()
+            validate.assert_not_called()
+            templates_type.assert_not_called()
+            runtime_type.assert_not_called()
+            backend_type.assert_not_called()
+            runtime.wait_ready.assert_not_called()
+            app_type.assert_not_called()
+            start = server.configure_lazy.call_args.args[0]
+            self.assertIs(start(), app_type.return_value)
+            tokenizer_type.assert_called_once_with(
+                mock.ANY, local_files_only=True, trust_remote_code=False
+            )
+            validate.assert_called_once()
+            templates_type.assert_called_once_with(tokenizer)
+            runtime_type.assert_called_once()
+            backend_type.assert_called_once()
+            runtime.wait_ready.assert_called_once_with()
+
+        server.serve_forever.side_effect = serve
+        with (
+            mock.patch.object(api, "parse_args", return_value=args),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", return_value=tokenizer
+            ) as tokenizer_type,
+            mock.patch.object(api, "validate_tokenizer") as validate,
+            mock.patch.object(api, "ChatTemplates") as templates_type,
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ) as runtime_type,
+            mock.patch.object(api, "NativeBackend") as backend_type,
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend") as app_type,
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api, "print_status"),
+        ):
+            api.main()
+        server.server_activate.assert_called_once_with()
+        server.configure_lazy.assert_called_once_with(
+            mock.ANY,
+            model="test-model",
+            model_names=("test-model",),
+            request_timeout=None,
+        )
+
+    def test_lazy_main_closes_cold_without_loading_model(self):
+        server = mock.Mock(server_port=8000)
+        with (
+            mock.patch.object(
+                api, "parse_args", return_value=main_args(lazy_load=True)
+            ),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+            mock.patch.object(api, "NativeBackend") as backend,
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api, "print_status"),
+        ):
+            api.main()
+        tokenizer.assert_not_called()
+        runtime.assert_not_called()
+        backend.assert_not_called()
+        server.server_close.assert_called_once_with()
+
+    def test_lazy_main_shutdown_during_tokenizer_load_starts_no_engine(self):
+        entered = threading.Event()
+        release = threading.Event()
+        server = mock.Mock(server_port=8000)
+        failures = []
+        worker = None
+
+        def load(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return object()
+
+        def serve():
+            nonlocal worker
+            start = server.configure_lazy.call_args.args[0]
+
+            def run_start():
+                try:
+                    start()
+                except api.engine_runtime.RuntimeClosed as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=run_start)
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+        server.serve_forever.side_effect = serve
+        try:
+            with (
+                mock.patch.object(
+                    api, "parse_args", return_value=main_args(lazy_load=True)
+                ),
+                unprepared_hold(),
+                mock.patch.object(api, "load_thinking_key", return_value=None),
+                mock.patch.object(
+                    api.AutoTokenizer, "from_pretrained", side_effect=load
+                ),
+                mock.patch.object(api, "validate_tokenizer"),
+                mock.patch.object(api, "ChatTemplates"),
+                mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+                mock.patch.object(api, "NativeBackend") as backend,
+                mock.patch.object(api, "FrontendServer", return_value=server),
+                mock.patch.object(api.signal, "signal"),
+                mock.patch.object(api, "print_status"),
+            ):
+                api.main()
+                release.set()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(failures), 1)
+                runtime.assert_not_called()
+                backend.assert_not_called()
+        finally:
+            release.set()
+            if worker is not None:
+                worker.join(3)
+
+    def test_main_closes_runtime_when_backend_creation_fails(self):
+        runtime = mock.Mock()
+        server = mock.Mock(server_port=8000)
+        with (
+            mock.patch.object(api, "parse_args", return_value=main_args()),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "NativeBackend", side_effect=RuntimeError("setup")),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api, "print_status"),
+            self.assertRaisesRegex(RuntimeError, "setup"),
+        ):
+            api.main()
+        runtime.close.assert_called_once_with()
+        server.server_activate.assert_not_called()
+        server.server_close.assert_called_once_with()
+
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
         args = main_args()
         runtime = mock.Mock()

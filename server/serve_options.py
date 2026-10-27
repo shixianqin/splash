@@ -527,6 +527,16 @@ SERVE_OPTIONS = (
         text=idle_release_text,
     ),
     ServeOption(
+        "--lazy-load",
+        "memory",
+        dict(
+            action="store_true",
+            default=False,
+            help="listen before loading the tokenizer and native model; the first "
+            "model-related POST waits for startup (default: load before listening)",
+        ),
+    ),
+    ServeOption(
         "--max-cache-disk",
         "cache",
         dict(

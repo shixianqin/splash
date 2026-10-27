@@ -104,6 +104,7 @@ access. It also completes local paths for `--model-dir`, `--draft-model` and
 | `--expert-memory` | Auto | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
+| `--lazy-load` | Off | Listen before loading the tokenizer and native model. The first model-related POST waits for startup; later idle releases still restore weights as usual. |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume, a quarter of its free space beyond a floor of 10 GiB (5% of a volume under 200 GiB), at most 32 GiB; a size such as `16G` is held as given while the volume keeps that floor; `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
@@ -913,7 +914,7 @@ Messages requires it.
 | `GET`, `DELETE /v1/responses/{id}` | A stored response ([Responses state](#responses-state)) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit after the engine starts |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
@@ -1561,6 +1562,18 @@ warning pressure, and reports 503 while macOS reports critical pressure;
 requests already running continue, and one that needs more memory is suspended
 until the pressure lifts.
 
+With `--lazy-load`, `/health`, `/status`, `/metrics` and `/v1/models` respond
+before the tokenizer and native engine load. `/v1/models` lists the configured
+model IDs and aliases; context and vision fields appear after startup determines
+their values.
+`/ready` returns 503 until the first model-related POST starts and completes
+the engine. Concurrent generation requests share that startup, bounded by
+`--queue-size`. A request reaching `--request-timeout` stops waiting without
+canceling the shared startup.
+An orchestrator that waits for `/ready` before sending any model request must
+send a warmup request explicitly when using this option. A startup failure is
+reported to the waiting requests and leaves the service unready until restart.
+
 `GET /metrics` exports in Prometheus text format the `requests`,
 `memory_actual` and `metrics` fields above, the status's scheduler, KV, cache,
 admission and image counts, the SSD cache's quota, limit, use, volume space,
@@ -2106,7 +2119,7 @@ text precedes its calls, the order the chat template renders, even where the
 response wrote text after a call.
 
 `server/chat_templates.py` probes each of the tokenizer's templates, including
-each named variant such as `tool_use`, once at startup, right after the
+each named variant such as `tool_use`, once during model startup, right after the
 tokenizer is validated and before the native runtime starts, so a tokenizer
 without a template Splash can serve stops startup before any weights load. The
 probe renders a canary conversation whose later system message carries a

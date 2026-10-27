@@ -12,6 +12,7 @@ import select
 import signal
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -558,7 +559,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok"})
             return
         if path == "/ready":
-            ready = self.app.backend.is_ready()
+            ready = self.server.app is not None and self.server.app.backend.is_ready()
             self._json(
                 200 if ready else 503, {"status": "ready" if ready else "unavailable"}
             )
@@ -575,31 +576,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match:
-            stored = self.app.response_store.get(response_match.group(1))
+            stored = (
+                self.server.app.response_store.get(response_match.group(1))
+                if self.server.app is not None
+                else None
+            )
             if stored is None:
                 self._safe_error(APIError(404, "response not found", "not_found_error"))
             else:
                 self._json(200, stored.response)
             return
         if path == "/v1/models" or path.startswith("/v1/models/"):
-            models = [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "splash",
-                    "max_model_len": self.app.max_context,
-                    "context_length": self.app.max_context,
-                    "vision": self.app.vision,
-                    "input_modalities": self.app.input_modalities,
-                    **(
-                        {"root": self.app.response_model}
-                        if name != self.app.response_model
-                        else {}
-                    ),
-                }
-                for name in self.app.model_names
-            ]
+            models = self.server.models()
             if path == "/v1/models":
                 # TypeSafe SDK compatibility: models.list() reads "models" entries.
                 typed = [
@@ -630,7 +618,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
         response_id = response_match.group(1)
-        if not self.app.response_store.delete(response_id):
+        if self.server.app is None or not self.server.app.response_store.delete(
+            response_id
+        ):
             self._safe_error(APIError(404, "response not found", "not_found_error"))
             return
         self._json(
@@ -644,10 +634,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if route is None:
             self._safe_error(APIError(404, "not found", "not_found"))
             return
-        refusal = None if route.prompt_only else self.app.backend.refusal()
-        if refusal is not None:
-            self._safe_error(refusal, log=False)
-            return
+        cold = self.server.app is None
+        if not cold:
+            refusal = None if route.prompt_only else self.app.backend.refusal()
+            if refusal is not None:
+                self._safe_error(refusal, log=False)
+                return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside
         # the native pending limit, and control endpoints need no such slot.
@@ -667,6 +659,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # The native job submitted last, which a failure cancels.
         self._submitted = None
         try:
+            if cold:
+                try:
+                    app = self.server.get_app(started_at)
+                finally:
+                    self._upload_deadline = time.monotonic() + self._upload_seconds(
+                        min(self._unread_body, self.server.max_request_bytes)
+                    )
+                refusal = None if route.prompt_only else app.backend.refusal()
+                if refusal is not None:
+                    self._safe_error(refusal, log=False)
+                    return
             generation = self._serve(route, started_at)
             if generation is not None:
                 self._generate(*generation, started_at)
@@ -680,7 +683,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._cancel_submitted()
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
-            self._safe_error(error, log=self._submitted is None or error.status >= 500)
+            self._safe_error(
+                error,
+                log=error.code != "model_start_failed"
+                and (self._submitted is None or error.status >= 500),
+            )
         except Exception as error:
             self._cancel_submitted()
             log_unexpected(error)
@@ -695,7 +702,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # freeing it returns the input it retains.
             self._submitted = None
             admission.release()
-            self.app.latencies.observe("http_request", time.monotonic() - started_at)
+            if self.server.app is not None:
+                self.server.app.latencies.observe(
+                    "http_request", time.monotonic() - started_at
+                )
 
     def _serve(self, route, started_at):
         """Read the request and serve it: answer it, or prepare the
@@ -1571,13 +1581,145 @@ class FrontendServer(HTTPServer):
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
+        self._lazy_start = None
+        self._lazy_lock = threading.Lock()
+        self._lazy_ready = threading.Event()
+        self._lazy_loading = False
+        self._lazy_error = None
+        self._lazy_request_timeout = math.inf
+        self._cold_model = None
+        self._cold_model_names = ()
+
+    def configure_lazy(self, start, *, model, model_names, request_timeout=None):
+        self._lazy_start = start
+        self._cold_model = model
+        self._cold_model_names = tuple(model_names)
+        self._lazy_request_timeout = (
+            math.inf if request_timeout is None else request_timeout
+        )
+        self._lazy_error = None
+        self._lazy_loading = False
+        self._lazy_ready.clear()
+
+    def _start_lazy(self):
+        try:
+            app = self._lazy_start()
+        except BaseException as error:
+            print_status(f"Error · model startup failed: {error}", error=True)
+            failure = APIError(
+                500, f"model startup failed: {error}", "model_start_failed"
+            )
+            with self._lazy_lock:
+                self._lazy_error = failure
+                self._lazy_loading = False
+                self._lazy_ready.set()
+        else:
+            with self._lazy_lock:
+                self.app = app
+                self._lazy_loading = False
+                self._lazy_ready.set()
+
+    def get_app(self, started_at):
+        deadline = started_at + self._lazy_request_timeout
+        if time.monotonic() >= deadline:
+            raise APIError(
+                504, "request timed out during model startup", "request_timeout"
+            )
+        if self.app is not None:
+            return self.app
+        with self._lazy_lock:
+            if self.app is None and self._lazy_start is None:
+                raise RuntimeError("server frontend is not configured")
+            if self.app is None and self._lazy_error is None and not self._lazy_loading:
+                self._lazy_loading = True
+                try:
+                    threading.Thread(
+                        target=self._start_lazy,
+                        name="splash-model-startup",
+                        daemon=True,
+                    ).start()
+                except RuntimeError as error:
+                    self._lazy_error = APIError(
+                        500, f"model startup failed: {error}", "model_start_failed"
+                    )
+                    self._lazy_loading = False
+                    self._lazy_ready.set()
+        timeout = (
+            None if math.isinf(deadline) else max(0.0, deadline - time.monotonic())
+        )
+        if not self._lazy_ready.wait(timeout) or time.monotonic() >= deadline:
+            raise APIError(
+                504, "request timed out during model startup", "request_timeout"
+            )
+        if self._lazy_error is not None:
+            error = self._lazy_error
+            raise APIError(error.status, error.message, error.code)
+        return self.app
+
+    def models(self):
+        app = self.app
+        names = app.model_names if app is not None else self._cold_model_names
+        response_model = app.response_model if app is not None else names[0]
+        details = (
+            {
+                "max_model_len": app.max_context,
+                "context_length": app.max_context,
+                "vision": app.vision,
+                "input_modalities": app.input_modalities,
+            }
+            if app is not None
+            else {}
+        )
+        return [
+            {
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "splash",
+                **details,
+                **({"root": response_model} if name != response_model else {}),
+            }
+            for name in names
+        ]
 
     def status(self):
-        status = self.app.status()
+        status = (
+            self.app.status()
+            if self.app is not None
+            else {
+                "schema_version": wire.STATUS_SCHEMA_VERSION,
+                "ready": False,
+                "transport": {
+                    "ready": False,
+                    "recovering": False,
+                    "stopped": self._lazy_error is not None,
+                    "pending": 0,
+                    "pending_limit": self.requests.capacity,
+                    "restarts": 0,
+                    "last_crash_trace": None,
+                    "status_stale": False,
+                    "status_age_ms": 0.0,
+                },
+                "startup": {
+                    "state": (
+                        "failed"
+                        if self._lazy_error is not None
+                        else "loading"
+                        if self._lazy_loading
+                        else "waiting"
+                    ),
+                    **(
+                        {"error": self._lazy_error.message}
+                        if self._lazy_error is not None
+                        else {}
+                    ),
+                },
+            }
+        )
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
-            "model": self.app.model,
+            "model": self.app.model if self.app is not None else self._cold_model,
             "host": self.server_address[0],
             "port": self.server_address[1],
             "started_at": self.started_at,
@@ -1749,6 +1891,8 @@ def main():
     server = None
     runtime = None
     backend = None
+    startup_lock = threading.Lock()
+    shutdown_requested = threading.Event()
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1760,8 +1904,8 @@ def main():
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         _raise_descriptor_limit()
         # Bind before loading the tokenizer or model so duplicates fail early.
-        # Activate only after the runtime is ready, keeping a partially started
-        # service from receiving requests.
+        # Normal mode activates after readiness; lazy mode activates first so
+        # control endpoints can respond while model startup waits for a POST.
         server = FrontendServer(
             (args.host, args.port),
             None,
@@ -1781,7 +1925,6 @@ def main():
                 error=True,
             )
         thinking_codec = ThinkingCodec(load_thinking_key())
-        print_status(f"Loading · {args.model}")
         # Nothing reads `held`: it keeps the assembly held until the server
         # exits, so that no installation collects the assembly its tokenizer
         # and engines, a relaunched one too, serve.
@@ -1794,74 +1937,112 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_root / "tokenizer", local_files_only=True, trust_remote_code=False
-        )
-        validate_tokenizer(tokenizer, family.chat_format)
-        thinking_end = thinking_end_tokens(
-            tokenizer, args.thinking_end_text, family.chat_format
-        )
-        chat_templates = ChatTemplates(tokenizer)
-        print_status(f"Chat template · {chat_templates.describe()}")
-        runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args, model_root),
-            relaunch_command=lambda first: _native_command(
-                args, model_root, first.max_context_tokens
-            ),
-            startup_timeout=NATIVE_START_TIMEOUT,
-            pending_limit=args.queue_size,
-        )
-        backend = NativeBackend(
-            runtime,
-            tokenizer,
-            request_logger=print_request,
-            thinking_end=thinking_end,
-        )
-        if not runtime.wait_ready():
-            raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
-        readiness = runtime.readiness
-        # The engine serves --max-context as given, and without it a context
-        # the native window holds.
-        if readiness is None or not (
-            readiness.max_context_tokens == args.max_context
-            if args.max_context is not None
-            else 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
-        ):
-            raise engine_runtime.EngineUnhealthy(
-                "native runtime reported an invalid context window"
-            )
-        effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
-        app = Frontend(
-            tokenizer,
-            backend,
-            args.model,
-            effective_context,
-            # No deadline unless given, as in vLLM and SGLang; a request still
-            # ends when its client disconnects.
-            math.inf if args.request_timeout is None else args.request_timeout,
-            readiness.max_concurrent_requests,
-            constraint_factory=constraint_factory,
-            chat_templates=chat_templates,
-            chat_format=family.chat_format,
-            max_image_pixels=args.max_image_pixels,
-            thinking_codec=thinking_codec,
-            served_model_names=args.served_model_name,
-            announce_served_name=args.announce_served_name,
-            default_reasoning_effort=args.default_reasoning_effort,
-            default_thinking_token_budget=args.thinking_token_budget,
-            vision=readiness.vision,
-        )
-        server.app = app
-        server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
-        context = (
-            f"{effective_context // 1024}K"
-            if effective_context % 1024 == 0
-            else f"{effective_context:,}"
-        )
-        mode = "" if readiness.vision else " · language only"
-        print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
+
+        def build_frontend():
+            nonlocal runtime, backend
+            print_status(f"Loading · {args.model}")
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_root / "tokenizer", local_files_only=True, trust_remote_code=False
+            )
+            validate_tokenizer(tokenizer, family.chat_format)
+            thinking_end = thinking_end_tokens(
+                tokenizer, args.thinking_end_text, family.chat_format
+            )
+            chat_templates = ChatTemplates(tokenizer)
+            print_status(f"Chat template · {chat_templates.describe()}")
+            with startup_lock:
+                if shutdown_requested.is_set():
+                    raise engine_runtime.RuntimeClosed("server is shutting down")
+                runtime = engine_runtime.MultiplexedRuntime(
+                    _native_command(args, model_root),
+                    relaunch_command=lambda first: _native_command(
+                        args, model_root, first.max_context_tokens
+                    ),
+                    startup_timeout=NATIVE_START_TIMEOUT,
+                    pending_limit=args.queue_size,
+                )
+                backend = NativeBackend(
+                    runtime,
+                    tokenizer,
+                    request_logger=print_request,
+                    thinking_end=thinking_end,
+                )
+            if not runtime.wait_ready():
+                raise engine_runtime.EngineUnhealthy(
+                    "native runtime did not become ready"
+                )
+            if shutdown_requested.is_set():
+                raise engine_runtime.RuntimeClosed("server is shutting down")
+            readiness = runtime.readiness
+            # The engine serves --max-context as given, and without it a
+            # context the native window holds.
+            if readiness is None or not (
+                readiness.max_context_tokens == args.max_context
+                if args.max_context is not None
+                else 1
+                <= readiness.max_context_tokens
+                <= serve_options.MAX_CONTEXT_TOKENS
+            ):
+                raise engine_runtime.EngineUnhealthy(
+                    "native runtime reported an invalid context window"
+                )
+            effective_context = readiness.max_context_tokens
+            constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
+            app = Frontend(
+                tokenizer,
+                backend,
+                args.model,
+                effective_context,
+                # No deadline unless given, as in vLLM and SGLang; a request
+                # still ends when its client disconnects.
+                math.inf if args.request_timeout is None else args.request_timeout,
+                readiness.max_concurrent_requests,
+                constraint_factory=constraint_factory,
+                chat_templates=chat_templates,
+                chat_format=family.chat_format,
+                max_image_pixels=args.max_image_pixels,
+                thinking_codec=thinking_codec,
+                served_model_names=args.served_model_name,
+                announce_served_name=args.announce_served_name,
+                default_reasoning_effort=args.default_reasoning_effort,
+                default_thinking_token_budget=args.thinking_token_budget,
+                vision=readiness.vision,
+            )
+            context = (
+                f"{effective_context // 1024}K"
+                if effective_context % 1024 == 0
+                else f"{effective_context:,}"
+            )
+            mode = "" if readiness.vision else " · language only"
+            return app, f"Ready · {args.model} · context {context}{mode} · {address}"
+
+        if args.lazy_load:
+
+            def start_lazy():
+                app, message = build_frontend()
+                print_status(message)
+                return app
+
+            response_model = (
+                args.served_model_name[0] if args.announce_served_name else args.model
+            )
+            server.configure_lazy(
+                start_lazy,
+                model=args.model,
+                model_names=tuple(
+                    dict.fromkeys((response_model, args.model, *args.served_model_name))
+                ),
+                request_timeout=args.request_timeout,
+            )
+            server.server_activate()
+            print_status(
+                f"Listening · {args.model} · loads on first model POST · {address}"
+            )
+        else:
+            server.app, message = build_frontend()
+            server.server_activate()
+            print_status(message)
         server.serve_forever()
     except (
         engine_runtime.EngineRuntimeError,
@@ -1887,10 +2068,13 @@ def main():
             signal.SIGINT,
             signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
         )
+        with startup_lock:
+            shutdown_requested.set()
+            resource = backend if backend is not None else runtime
         try:
-            if backend is not None:
+            if resource is not None:
                 print_status("Stopping · releasing engine resources")
-                backend.close()
+                resource.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
